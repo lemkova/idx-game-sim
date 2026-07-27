@@ -1,0 +1,12 @@
+[package]
+name = "idx-game-sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31"
+egui_extras = "0.31"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[profile.release]
+lto = true
