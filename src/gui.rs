@@ -232,8 +232,8 @@ impl eframe::App for GuiApp {
         }
         self.was_ended = ended;
 
-        self.header(ctx);
         self.toolbar(ctx);
+        self.header(ctx);
         self.status_bar(ctx);
         self.tapes(ctx);
         self.left_panel(ctx);
