@@ -32,6 +32,7 @@ pub struct EntryForm {
     pub otype: OrdType,
     pub price: Price,
     pub lots: Lots,
+    pub use_margin: bool, // "Use Limit": finance buys with the stock's margin facility
 }
 
 impl EntryForm {
@@ -41,6 +42,7 @@ impl EntryForm {
             otype: OrdType::Limit,
             price: 0,
             lots: 10,
+            use_margin: false,
         }
     }
 }
@@ -175,8 +177,7 @@ impl App {
             let evs: Vec<Trade> = self.markets[s].events.drain(..).collect();
             for t in evs {
                 if t.buyer == OwnerId::Player {
-                    self.player
-                        .buy_fill(s, t.buy_oid, t.price, t.lots, t.ts, self.defs[s].leverage);
+                    self.player.buy_fill(s, t.buy_oid, t.price, t.lots, t.ts);
                 }
                 if t.seller == OwnerId::Player {
                     self.player.sell_fill(s, t.sell_oid, t.price, t.lots, t.ts);
@@ -252,6 +253,12 @@ impl App {
         let s = self.selected;
         let side = self.entry.side;
         let lots = self.entry.lots;
+        // Margin is opt-in per order; gorengan (leverage 1) is always cash.
+        let lev = if self.entry.use_margin {
+            self.defs[s].leverage.max(1)
+        } else {
+            1
+        };
         let now = self.tick;
         let ticker = self.defs[s].ticker;
         if lots <= 0 {
@@ -272,8 +279,7 @@ impl App {
                 match side {
                     Side::Bid => {
                         let value = lots * SHARES_PER_LOT * price;
-                        let lock =
-                            margin_cash(value, self.defs[s].leverage) + idx::fee_buy(value);
+                        let lock = margin_cash(value, lev) + idx::fee_buy(value);
                         if self.player.cash < lock {
                             self.toast_err(format!(
                                 "Insufficient cash: need {}",
@@ -302,6 +308,7 @@ impl App {
                                     filled: 0,
                                     status: OrderStatus::Open,
                                     locked: lock,
+                                    leverage: lev,
                                     ts: now,
                                 });
                                 self.drain_events();
@@ -338,6 +345,7 @@ impl App {
                                     filled: 0,
                                     status: OrderStatus::Open,
                                     locked: 0,
+                                    leverage: 1,
                                     ts: now,
                                 });
                                 self.drain_events();
@@ -358,7 +366,7 @@ impl App {
                     return;
                 }
                 if side == Side::Bid {
-                    let cost = margin_cash(value, self.defs[s].leverage) + idx::fee_buy(value);
+                    let cost = margin_cash(value, lev) + idx::fee_buy(value);
                     if self.player.cash < cost {
                         self.toast_err(format!("Insufficient cash: need {}", idx::thousands(cost)));
                         return;
@@ -389,6 +397,7 @@ impl App {
                             filled: 0,
                             status: OrderStatus::Open,
                             locked: 0,
+                            leverage: lev,
                             ts: now,
                         });
                         self.drain_events();

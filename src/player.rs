@@ -22,7 +22,8 @@ pub struct PlayerOrder {
     pub lots: Lots,
     pub filled: Lots,
     pub status: OrderStatus,
-    pub locked: i64, // cash locked for open limit buys
+    pub locked: i64,   // cash locked for open limit buys
+    pub leverage: i64, // margin multiplier chosen at entry (1 = cash-only)
     pub ts: u64,
 }
 
@@ -101,22 +102,16 @@ impl Player {
     }
 
     /// A buy fill hit one of our orders (resting limit or immediate). With
-    /// `leverage` > 1 only `value/leverage` cash is spent; the rest is booked
-    /// as margin debt against the position.
-    pub fn buy_fill(
-        &mut self,
-        stock: usize,
-        oid: u64,
-        price: Price,
-        lots: Lots,
-        ts: u64,
-        leverage: i64,
-    ) {
+    /// order leverage > 1 only `value/leverage` cash is spent; the rest is
+    /// booked as margin debt against the position.
+    pub fn buy_fill(&mut self, stock: usize, oid: u64, price: Price, lots: Lots, ts: u64) {
         let value = lots * SHARES_PER_LOT * price;
         let fee = idx::fee_buy(value);
 
         let mut release = 0;
+        let mut leverage = 1;
         if let Some(o) = self.find_order(stock, oid) {
+            leverage = o.leverage.max(1);
             o.filled += lots;
             if o.locked > 0 {
                 // Re-target the lock to the remaining size at the limit price;
@@ -243,11 +238,12 @@ mod tests {
             filled: 0,
             status: OrderStatus::Open,
             locked: lock,
+            leverage: 1,
             ts: 0,
         });
 
         // Partial fill 4 lots at a better price (1545).
-        p.buy_fill(2, 7, 1545, 4, 1, 1);
+        p.buy_fill(2, 7, 1545, 4, 1);
         assert_eq!(p.positions[2].lots, 4);
         assert!((p.positions[2].avg - 1545.0).abs() < 1e-9);
         assert_eq!(p.orders[0].filled, 4);
@@ -281,6 +277,7 @@ mod tests {
             filled: 0,
             status: OrderStatus::Open,
             locked: 0,
+            leverage: 1,
             ts: 0,
         });
         p.sell_fill(0, 3, 1100, 10, 5);
@@ -308,9 +305,10 @@ mod tests {
             filled: 0,
             status: OrderStatus::Open,
             locked: 0,
+            leverage: 4,
             ts: 0,
         });
-        p.buy_fill(1, 9, 2000, 100, 1, 4);
+        p.buy_fill(1, 9, 2000, 100, 1);
         assert_eq!(p.cash, INITIAL_CASH - value / 4 - fee);
         assert_eq!(p.positions[1].debt, value - value / 4);
         // Flat P&L mark: equity only drops by the fee paid.
@@ -327,6 +325,7 @@ mod tests {
             filled: 0,
             status: OrderStatus::Open,
             locked: 0,
+            leverage: 1,
             ts: 2,
         });
         let half_debt = (value - value / 4) / 2;
@@ -345,6 +344,7 @@ mod tests {
             filled: 0,
             status: OrderStatus::Open,
             locked: 0,
+            leverage: 1,
             ts: 4,
         });
         p.sell_fill(1, 11, 2100, 50, 5);

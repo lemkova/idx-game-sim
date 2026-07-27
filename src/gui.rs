@@ -834,10 +834,16 @@ impl GuiApp {
                     });
                 }
             }
-            // lots
+            // lots: -/+ steppers, quick adds, and a %-of-buying-power slider
             ui.horizontal(|ui| {
                 ui.label(dim("Lots "));
+                if ui.button(fg("−")).clicked() {
+                    self.app.entry.lots = (self.app.entry.lots - 1).max(1);
+                }
                 ui.add(DragValue::new(&mut self.app.entry.lots).range(1..=1_000_000).speed(1.0));
+                if ui.button(fg("+")).clicked() {
+                    self.app.entry.lots += 1;
+                }
                 for step in [10i64, 100] {
                     if ui.button(fg(format!("+{step}"))).clicked() {
                         self.app.entry.lots += step;
@@ -847,6 +853,49 @@ impl GuiApp {
                     self.app.entry.lots = 1;
                 }
             });
+            // "Use Limit" = finance buys through the stock's margin facility.
+            let use_margin = self.app.entry.use_margin && lev > 1;
+            if self.app.entry.side == Side::Bid && lev > 1 {
+                ui.checkbox(
+                    &mut self.app.entry.use_margin,
+                    fg(format!("Use Limit — ⚡{lev}x buying power")),
+                );
+            }
+            let eff_lev = if use_margin && self.app.entry.side == Side::Bid { lev } else { 1 };
+            // Sizing slider: drag to pick lots as a share of what you can afford
+            // (buys: cash × leverage at the ticket price; sells: free lots).
+            let ref_px = match self.app.entry.otype {
+                OrdType::Limit => self.app.entry.price,
+                OrdType::Market => self.app.markets[s].last,
+            }
+            .max(1);
+            let max_lots = match self.app.entry.side {
+                Side::Bid => {
+                    let lot_val = SHARES_PER_LOT * ref_px;
+                    let per_lot = margin_cash(lot_val, eff_lev) + idx::fee_buy(lot_val);
+                    self.app.player.cash / per_lot.max(1)
+                }
+                Side::Offer => self.app.player.free_lots(s),
+            };
+            if max_lots > 0 {
+                ui.horizontal(|ui| {
+                    let mut pct =
+                        (self.app.entry.lots as f64 * 100.0 / max_lots as f64).clamp(0.0, 100.0);
+                    let slider = egui::Slider::new(&mut pct, 0.0..=100.0)
+                        .show_value(false)
+                        .step_by(1.0);
+                    if ui.add(slider).changed() {
+                        self.app.entry.lots =
+                            ((pct / 100.0 * max_lots as f64).round() as i64).clamp(1, max_lots);
+                    }
+                    ui.label(dim(format!("{pct:.0}% · max {} lot", idx::thousands(max_lots))));
+                });
+            } else {
+                ui.label(dim(match self.app.entry.side {
+                    Side::Bid => "no buying power at this price",
+                    Side::Offer => "no free lots to sell",
+                }));
+            }
             // value + fee
             let e = &self.app.entry;
             let (value, fee) = match e.otype {
@@ -869,10 +918,10 @@ impl GuiApp {
                 ui.label(dim("Value"));
                 ui.label(col(idx::thousands(value), WHITE));
                 ui.label(dim(format!("fee {}", idx::thousands(fee))));
-                if e.side == Side::Bid && lev > 1 {
+                if e.side == Side::Bid && eff_lev > 1 {
                     // Margin: only value/leverage of cash is committed up front.
                     ui.label(col(
-                        format!("cash {}", idx::thousands(margin_cash(value, lev) + fee)),
+                        format!("cash {}", idx::thousands(margin_cash(value, eff_lev) + fee)),
                         CYAN,
                     ));
                 }
