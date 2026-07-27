@@ -18,7 +18,7 @@ pub const SESSION_SECS: u64 = 600; // 10 minute session
 pub const CANDLE_TICKS: u64 = 60 * TICKS_PER_SEC; // 1-minute chart candles
 pub const WARMUP_TICKS: u64 = 200;
 pub const GLOBAL_TAPE_CAP: usize = 800;
-pub const BOOK_DEPTH: usize = 10;
+pub const BOOK_DEPTH: usize = 5; // best levels shown in the orderbook panel
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
