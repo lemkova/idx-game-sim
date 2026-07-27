@@ -27,15 +27,24 @@ unzip, and run `idx-game-sim.exe`. No installer, no dependencies.
   personality (spread, depth, retail flow, whale behavior).
 - **IDX mechanics**: 1 lot = 100 shares, real tick-size ladder, ARA/ARB
   auto-reject price bounds, and realistic buy/sell fees.
-- **Order book**: full depth with per-level order queues — click a LOTS
-  number to inspect the live queue at that price.
-- **Real intraday anonymity**: like the real IDX, broker codes and
-  foreign/domestic investor types are *hidden* while the market trades.
-  Your own orders are always marked `YOU`.
+- **Orderbook panel**: 5 best levels with freq/lot per side, buy-vs-sell
+  pressure bar, and per-level order queues — click a LOTS number to
+  inspect the live queue at that price.
+- **1-minute chart**: candlestick + volume chart of the session, drawn by
+  a built-in charting engine.
+- **Margin & leverage**: liquidity-tiered margin — `BNKA` 4x, `TLCO` 3x,
+  `NIKL` 2x, while gorengan `SAWT` trades cash-only. Leveraged buys
+  commit `value/leverage` cash and book the rest as margin debt, repaid
+  as you sell.
+- **Real intraday anonymity**: like the real IDX, broker codes,
+  foreign/domestic investor types, and foreign buy/sell value are
+  *hidden* while the market trades. Your own orders are always marked
+  `YOU`.
 
 ### Post-close reports
 
-After the close everything is revealed, IDX-style:
+After the close everything is revealed, IDX-style: F Buy / F Sell in the
+orderbook panel, broker codes on the tapes, plus three reports:
 
 - **Broker Summary** — per-stock buy/sell volume, value, and average price by
   broker, with foreign/domestic flags.
