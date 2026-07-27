@@ -41,6 +41,14 @@ pub struct Position {
     pub lots: Lots,
     pub avg: f64,      // average price ex-fee
     pub realized: i64, // realized P&L ex-fee
+    pub debt: i64,     // margin loan financing this position
+}
+
+/// Cash the player must put up for `value` bought at `leverage`; the
+/// remainder is financed as margin debt on the position.
+pub fn margin_cash(value: i64, leverage: i64) -> i64 {
+    let lev = leverage.max(1);
+    (value + lev - 1) / lev
 }
 
 pub struct Player {
@@ -70,12 +78,13 @@ impl Player {
         self.positions[stock].lots - self.reserved_lots[stock]
     }
 
+    /// Cash + reservations + stock value net of margin debt.
     pub fn equity(&self, lasts: [Price; 4]) -> i64 {
         let stock_val: i64 = self
             .positions
             .iter()
             .zip(lasts)
-            .map(|(p, last)| p.lots * SHARES_PER_LOT * last)
+            .map(|(p, last)| p.lots * SHARES_PER_LOT * last - p.debt)
             .sum();
         self.cash + self.reserved_cash + stock_val
     }
@@ -91,8 +100,18 @@ impl Player {
             .find(|o| o.stock == stock && o.oid == oid)
     }
 
-    /// A buy fill hit one of our orders (resting limit or immediate).
-    pub fn buy_fill(&mut self, stock: usize, oid: u64, price: Price, lots: Lots, ts: u64) {
+    /// A buy fill hit one of our orders (resting limit or immediate). With
+    /// `leverage` > 1 only `value/leverage` cash is spent; the rest is booked
+    /// as margin debt against the position.
+    pub fn buy_fill(
+        &mut self,
+        stock: usize,
+        oid: u64,
+        price: Price,
+        lots: Lots,
+        ts: u64,
+        leverage: i64,
+    ) {
         let value = lots * SHARES_PER_LOT * price;
         let fee = idx::fee_buy(value);
 
@@ -103,7 +122,7 @@ impl Player {
                 // Re-target the lock to the remaining size at the limit price;
                 // the difference goes back to free cash before we pay the fill.
                 let rem_val = (o.lots - o.filled) * SHARES_PER_LOT * o.price;
-                let target = rem_val + idx::fee_buy(rem_val);
+                let target = margin_cash(rem_val, leverage) + idx::fee_buy(rem_val);
                 release = (o.locked - target).max(0);
                 o.locked -= release;
             }
@@ -114,8 +133,10 @@ impl Player {
         self.reserved_cash -= release;
         self.cash += release;
 
-        self.cash -= value + fee;
+        let cash_part = margin_cash(value, leverage);
+        self.cash -= cash_part + fee;
         self.fees += fee;
+        self.positions[stock].debt += value - cash_part;
 
         let p = &mut self.positions[stock];
         let old_shares = p.lots * SHARES_PER_LOT;
@@ -150,10 +171,18 @@ impl Player {
         }
         self.reserved_lots[stock] -= release_lots;
 
-        self.cash += value - fee;
+        // Selling repays margin debt proportionally to the lots sold; the
+        // final lot clears the loan exactly (no rounding residue).
+        let p = &mut self.positions[stock];
+        let repay = if lots >= p.lots {
+            p.debt
+        } else {
+            p.debt * lots / p.lots
+        };
+        p.debt -= repay;
+        self.cash += value - fee - repay;
         self.fees += fee;
 
-        let p = &mut self.positions[stock];
         p.realized += ((price as f64 - p.avg) * (lots * SHARES_PER_LOT) as f64).round() as i64;
         p.lots -= lots;
         if p.lots <= 0 {
@@ -218,7 +247,7 @@ mod tests {
         });
 
         // Partial fill 4 lots at a better price (1545).
-        p.buy_fill(2, 7, 1545, 4, 1);
+        p.buy_fill(2, 7, 1545, 4, 1, 1);
         assert_eq!(p.positions[2].lots, 4);
         assert!((p.positions[2].avg - 1545.0).abs() < 1e-9);
         assert_eq!(p.orders[0].filled, 4);
@@ -239,6 +268,7 @@ mod tests {
             lots: 10,
             avg: 1000.0,
             realized: 0,
+            debt: 0,
         };
         p.reserved_lots[0] = 10;
         p.orders.push(PlayerOrder {
@@ -260,5 +290,67 @@ mod tests {
         assert_eq!(p.orders[0].status, OrderStatus::Filled);
         let value = 10 * SHARES_PER_LOT * 1100;
         assert_eq!(p.cash, INITIAL_CASH + value - idx::fee_sell(value));
+    }
+
+    #[test]
+    fn margin_buy_finances_and_sell_repays() {
+        let mut p = Player::new();
+        // Market buy 100 lot @ 2,000 at 4x: value 20,000,000, cash part 5,000,000.
+        let value = 100 * SHARES_PER_LOT * 2000;
+        let fee = idx::fee_buy(value);
+        p.orders.push(PlayerOrder {
+            stock: 1,
+            oid: 9,
+            side: Side::Bid,
+            otype: OrdType::Market,
+            price: 2000,
+            lots: 100,
+            filled: 0,
+            status: OrderStatus::Open,
+            locked: 0,
+            ts: 0,
+        });
+        p.buy_fill(1, 9, 2000, 100, 1, 4);
+        assert_eq!(p.cash, INITIAL_CASH - value / 4 - fee);
+        assert_eq!(p.positions[1].debt, value - value / 4);
+        // Flat P&L mark: equity only drops by the fee paid.
+        assert_eq!(p.equity([0, 2000, 0, 0]), INITIAL_CASH - fee);
+
+        // Sell half: half the loan is repaid.
+        p.orders.push(PlayerOrder {
+            stock: 1,
+            oid: 10,
+            side: Side::Offer,
+            otype: OrdType::Market,
+            price: 2100,
+            lots: 50,
+            filled: 0,
+            status: OrderStatus::Open,
+            locked: 0,
+            ts: 2,
+        });
+        let half_debt = (value - value / 4) / 2;
+        p.sell_fill(1, 10, 2100, 50, 3);
+        assert_eq!(p.positions[1].debt, half_debt);
+        assert_eq!(p.positions[1].lots, 50);
+
+        // Sell the rest: loan fully cleared, no residue.
+        p.orders.push(PlayerOrder {
+            stock: 1,
+            oid: 11,
+            side: Side::Offer,
+            otype: OrdType::Market,
+            price: 2100,
+            lots: 50,
+            filled: 0,
+            status: OrderStatus::Open,
+            locked: 0,
+            ts: 4,
+        });
+        p.sell_fill(1, 11, 2100, 50, 5);
+        assert_eq!(p.positions[1].debt, 0);
+        assert_eq!(p.positions[1].lots, 0);
+        // Realized: (2100-2000) * 100 lot * 100 shares.
+        assert_eq!(p.positions[1].realized, 100 * 100 * SHARES_PER_LOT);
     }
 }

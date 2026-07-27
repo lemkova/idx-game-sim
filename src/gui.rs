@@ -8,10 +8,10 @@ use eframe::egui::{
 };
 use egui_extras::{Column, TableBuilder};
 
-use crate::app::{App, Mode, BOOK_DEPTH, TICKS_PER_SEC};
+use crate::app::{App, Mode, BOOK_DEPTH, SESSION_SECS, TICKS_PER_SEC};
 use crate::idx;
-use crate::market::StockDef;
-use crate::player::{OrderStatus, INITIAL_CASH};
+use crate::market::{Candle, Market, StockDef};
+use crate::player::{margin_cash, OrderStatus, INITIAL_CASH};
 use crate::types::{
     AgentKind, Lots, OrdType, OwnerId, Price, Side, Trade, BROKERS_DOMESTIC, BROKERS_FOREIGN,
     BROKERS_LP, BROKER_PLAYER, SHARES_PER_LOT,
@@ -159,6 +159,7 @@ pub struct GuiApp {
     app: App,
     next_tick: Instant,
     ticket_stock: usize,
+    ticket_open: bool, // floating order-ticket window
     queue_view: Option<(usize, Side, Price)>, // (stock, side, price) under inspection
     admin_open: bool,
     admin_balance: String, // balance input buffer for the admin window
@@ -188,6 +189,7 @@ impl GuiApp {
             app,
             next_tick: Instant::now() + tick_dur(),
             ticket_stock: 0,
+            ticket_open: false,
             queue_view: None,
             admin_open: false,
             admin_balance: String::new(),
@@ -235,10 +237,10 @@ impl eframe::App for GuiApp {
         self.toolbar(ctx);
         self.header(ctx);
         self.status_bar(ctx);
-        self.tapes(ctx);
         self.left_panel(ctx);
         self.right_panel(ctx);
         self.center_panel(ctx);
+        self.ticket_window(ctx);
         self.queue_window(ctx);
         self.admin_window(ctx);
 
@@ -264,9 +266,11 @@ impl GuiApp {
             }
             if i.key_pressed(Key::B) {
                 self.app.open_form(Side::Bid, None);
+                self.ticket_open = true;
             }
             if i.key_pressed(Key::S) {
                 self.app.open_form(Side::Offer, None);
+                self.ticket_open = true;
             }
             if i.key_pressed(Key::P) && self.app.mode != Mode::Ended {
                 self.app.toggle_pause();
@@ -392,47 +396,46 @@ impl GuiApp {
             .resizable(false)
             .show(ctx, |ui| {
                 section(ui, "WATCHLIST");
-                let rows: Vec<(String, String, i64, String, String)> = self
-                    .app
-                    .defs
-                    .iter()
-                    .zip(self.app.markets.iter())
-                    .map(|(d, m)| {
-                        (
-                            d.ticker.to_string(),
-                            idx::thousands(m.last),
-                            m.change(),
-                            format!("{:+.2}%", m.change_pct()),
-                            idx::compact(m.volume_lots),
-                        )
-                    })
-                    .collect();
                 let selected = self.app.selected;
                 let mut clicked: Option<usize> = None;
                 ui.push_id("watchlist", |ui| {
                     TableBuilder::new(ui)
                         .striped(true)
                         .sense(Sense::click())
-                        .column(Column::exact(56.0))
-                        .column(Column::exact(72.0))
-                        .column(Column::exact(72.0))
+                        .column(Column::exact(46.0))
+                        .column(Column::exact(28.0))
+                        .column(Column::exact(64.0))
+                        .column(Column::exact(64.0))
                         .column(Column::remainder())
                         .header(18.0, |mut h| {
-                            h.col(|ui| { ui.label(dim("TKR")); });
-                            h.col(|ui| { ui.label(dim("LAST")); });
-                            h.col(|ui| { ui.label(dim("CHG%")); });
-                            h.col(|ui| { ui.label(dim("VOL")); });
+                            for t in ["TKR", "⚡", "LAST", "CHG%", "VOL"] {
+                                h.col(|ui| { ui.label(dim(t)); });
+                            }
                         })
                         .body(|body| {
-                            body.rows(20.0, rows.len(), |mut row| {
+                            body.rows(20.0, self.app.defs.len(), |mut row| {
                                 let i = row.index();
                                 row.set_selected(i == selected);
-                                let (tkr, last, chg, pct, vol) = &rows[i];
-                                let c = chg_color(*chg);
-                                row.col(|ui| { ui.label(col(tkr.clone(), WHITE).strong()); });
-                                row.col(|ui| { ui.label(col(format!("{last:>7}"), c)); });
-                                row.col(|ui| { ui.label(col(format!("{pct:>7}"), c)); });
-                                row.col(|ui| { ui.label(col(format!("{vol:>7}"), FG)); });
+                                let d = &self.app.defs[i];
+                                let m = &self.app.markets[i];
+                                let c = chg_color(m.change());
+                                row.col(|ui| { ui.label(col(d.ticker, WHITE).strong()); });
+                                row.col(|ui| {
+                                    if d.leverage > 1 {
+                                        ui.label(col(format!("{}x", d.leverage), CYAN));
+                                    } else {
+                                        ui.label(dim("·"));
+                                    }
+                                });
+                                row.col(|ui| {
+                                    ui.label(col(format!("{:>7}", idx::thousands(m.last)), c));
+                                });
+                                row.col(|ui| {
+                                    ui.label(col(format!("{:>7}", format!("{:+.2}%", m.change_pct())), c));
+                                });
+                                row.col(|ui| {
+                                    ui.label(fg(format!("{:>6}", idx::compact(m.volume_lots))));
+                                });
                                 if row.response().clicked() {
                                     clicked = Some(i);
                                 }
@@ -473,39 +476,14 @@ impl GuiApp {
                         }
                     });
 
-                ui.separator();
-                let p = &self.app.player;
-                let stock_val: i64 = p
-                    .positions
-                    .iter()
-                    .zip(lasts)
-                    .map(|(pos, last)| pos.lots * SHARES_PER_LOT * last)
-                    .sum();
-                let realized: i64 = p.positions.iter().map(|x| x.realized).sum();
-                let pnl = self.app.pnl();
-                let pct = pnl as f64 * 100.0 / INITIAL_CASH as f64;
-                egui::Grid::new("totals")
-                    .num_columns(2)
-                    .spacing([10.0, 3.0])
-                    .show(ui, |ui| {
-                        let kv = |ui: &mut egui::Ui, k: &str, v: String, c: Color32| {
-                            ui.label(dim(k));
-                            ui.label(col(format!("{v:>16}"), c));
-                            ui.end_row();
-                        };
-                        kv(ui, "CASH", idx::thousands(p.cash), FG);
-                        kv(ui, "LOCKED", idx::thousands(p.reserved_cash), FG);
-                        kv(ui, "STOCK", idx::thousands(stock_val), FG);
-                        kv(ui, "EQUITY", idx::thousands(self.app.equity()), WHITE);
-                        kv(ui, "REALIZED", idx::signed_thousands(realized), chg_color(realized));
-                        kv(ui, "FEES", idx::thousands(p.fees), DIM);
-                        kv(
-                            ui,
-                            "NET P&L",
-                            format!("{} {:+.2}%", idx::signed_thousands(pnl), pct),
-                            chg_color(pnl),
-                        );
-                    });
+                // Whole-market prints fill the rest of the panel.
+                ui.add_space(2.0);
+                let rows = tape_rows(
+                    &self.app,
+                    self.app.global_tape.iter().rev().take(80),
+                    self.revealed(),
+                );
+                draw_tape(ui, "MARKET TRADE", "market_tape", &rows, true);
             });
     }
 
@@ -513,13 +491,254 @@ impl GuiApp {
 
     fn right_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("right")
-            .exact_width(380.0)
+            .exact_width(360.0)
             .resizable(false)
             .show(ctx, |ui| {
-                self.ticket(ui);
-                self.orders_table(ui);
-                self.trades_table(ui);
+                self.orderbook_panel(ui);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 8.0) / 2.0;
+                    if ui
+                        .add_sized([w, 28.0], Button::new(col("BUY", GREEN).strong()).fill(GREEN_DARK))
+                        .clicked()
+                    {
+                        self.app.open_form(Side::Bid, None);
+                        self.ticket_open = true;
+                    }
+                    if ui
+                        .add_sized([w, 28.0], Button::new(col("SELL", RED).strong()).fill(RED_DARK))
+                        .clicked()
+                    {
+                        self.app.open_form(Side::Offer, None);
+                        self.ticket_open = true;
+                    }
+                });
+                ui.add_space(2.0);
+                let s = self.app.selected;
+                let rows = tape_rows(
+                    &self.app,
+                    self.app.markets[s].tape.iter().rev().take(80),
+                    self.revealed(),
+                );
+                draw_tape(ui, "RUNNING TRADE", "running_trade", &rows, false);
             });
+    }
+
+    /// Stockbit-style orderbook: stats grid + combined bid/offer depth table.
+    fn orderbook_panel(&mut self, ui: &mut egui::Ui) {
+        let s = self.app.selected;
+        let d = &self.app.defs[s];
+        let revealed = self.revealed();
+        {
+            let m = &self.app.markets[s];
+            let chg = m.change();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(" {} ", d.ticker))
+                        .color(WHITE)
+                        .background_color(SEL_BG)
+                        .strong()
+                        .size(14.0),
+                );
+                if d.leverage > 1 {
+                    ui.label(col(format!("⚡{}x", d.leverage), CYAN));
+                }
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    let arrow = if chg > 0 { "▲" } else if chg < 0 { "▼" } else { "•" };
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {} ({:+.2}%)",
+                            idx::thousands(m.last),
+                            arrow,
+                            m.change_pct()
+                        ))
+                        .color(chg_color(chg))
+                        .strong()
+                        .size(14.0),
+                    );
+                });
+            });
+            ui.label(dim(d.name));
+            let avg = if m.volume_lots > 0 {
+                m.value / (m.volume_lots * SHARES_PER_LOT)
+            } else {
+                0
+            };
+            let kv = |ui: &mut egui::Ui, k: &str, v: String, c: Color32| {
+                ui.label(dim(k));
+                ui.label(col(v, c));
+            };
+            egui::Grid::new("ob_stats").num_columns(6).spacing([14.0, 2.0]).show(ui, |ui| {
+                kv(ui, "Open", idx::thousands(m.open), px_color(m.prev_close, m.open));
+                kv(ui, "Prev", idx::thousands(m.prev_close), FG);
+                kv(ui, "Lot", idx::compact(m.volume_lots), FG);
+                ui.end_row();
+                kv(ui, "High", idx::thousands(m.high), px_color(m.prev_close, m.high));
+                kv(ui, "ARA", idx::thousands(m.upper_bound), GREEN);
+                kv(ui, "Val", idx::compact(m.value), FG);
+                ui.end_row();
+                kv(ui, "Low", idx::thousands(m.low), px_color(m.prev_close, m.low));
+                kv(ui, "ARB", idx::thousands(m.lower_bound), RED);
+                kv(ui, "Avg", idx::thousands(avg), FG);
+                ui.end_row();
+                if revealed {
+                    kv(ui, "F Buy", idx::compact(m.f_buy_val), YELLOW);
+                    kv(ui, "F Sell", idx::compact(m.f_sell_val), YELLOW);
+                } else {
+                    // Foreign flow is only published after the closing bell.
+                    kv(ui, "F Buy", "—".into(), DIM);
+                    kv(ui, "F Sell", "—".into(), DIM);
+                }
+                kv(ui, "Freq", idx::thousands(m.trade_count as i64), FG);
+                ui.end_row();
+            });
+        }
+        ui.separator();
+
+        let prev = self.app.markets[s].prev_close;
+        let bids = self.app.markets[s].levels(Side::Bid, BOOK_DEPTH);
+        let offers = self.app.markets[s].levels(Side::Offer, BOOK_DEPTH);
+        let mark = |side: Side, price: Price| -> bool {
+            self.app.player.open_orders().any(|o| {
+                o.stock == s && o.side == side && o.otype == OrdType::Limit && o.price == price
+            })
+        };
+        // (freq, lots, price text, raw price, color)
+        let row_of = |l: &crate::book::LevelView, side: Side| {
+            (
+                idx::thousands(l.freq as i64),
+                idx::thousands(l.lots),
+                format!(
+                    "{}{}",
+                    if mark(side, l.price) { "•" } else { "" },
+                    idx::thousands(l.price)
+                ),
+                l.price,
+                px_color(prev, l.price),
+            )
+        };
+        let bid_rows: Vec<_> = bids.iter().map(|l| row_of(l, Side::Bid)).collect();
+        let offer_rows: Vec<_> = offers.iter().map(|l| row_of(l, Side::Offer)).collect();
+
+        let mut price_pick: Option<Price> = None;
+        let mut queue_pick: Option<(Side, Price)> = None;
+        ui.push_id("orderbook", |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .column(Column::exact(34.0))
+                .column(Column::exact(72.0))
+                .column(Column::exact(56.0))
+                .column(Column::exact(56.0))
+                .column(Column::exact(72.0))
+                .column(Column::remainder())
+                .header(18.0, |mut h| {
+                    for t in ["FREQ", "LOT", "BID", "OFFER", "LOT", "FREQ"] {
+                        h.col(|ui| { ui.label(dim(t)); });
+                    }
+                })
+                .body(|body| {
+                    body.rows(19.0, BOOK_DEPTH, |mut row| {
+                        let r = row.index();
+                        let clickable_lots =
+                            |ui: &mut egui::Ui, lots: &str, side: Side, px: Price,
+                             queue_pick: &mut Option<(Side, Price)>| {
+                                let resp = ui
+                                    .add(Label::new(fg(format!("{lots:>8}"))).sense(Sense::click()))
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("view order queue");
+                                if resp.clicked() {
+                                    *queue_pick = Some((side, px));
+                                }
+                            };
+                        let clickable_price =
+                            |ui: &mut egui::Ui, text: &str, c: Color32, px: Price,
+                             price_pick: &mut Option<Price>| {
+                                let resp = ui
+                                    .add(Label::new(col(text, c).strong()).sense(Sense::click()))
+                                    .on_hover_cursor(CursorIcon::PointingHand);
+                                if resp.clicked() {
+                                    *price_pick = Some(px);
+                                }
+                            };
+                        match bid_rows.get(r) {
+                            Some((freq, lots, text, px, c)) => {
+                                row.col(|ui| { ui.label(dim(format!("{freq:>5}"))); });
+                                row.col(|ui| clickable_lots(ui, lots, Side::Bid, *px, &mut queue_pick));
+                                row.col(|ui| clickable_price(ui, text, *c, *px, &mut price_pick));
+                            }
+                            None => {
+                                row.col(|_| {});
+                                row.col(|_| {});
+                                row.col(|_| {});
+                            }
+                        }
+                        match offer_rows.get(r) {
+                            Some((freq, lots, text, px, c)) => {
+                                row.col(|ui| clickable_price(ui, text, *c, *px, &mut price_pick));
+                                row.col(|ui| clickable_lots(ui, lots, Side::Offer, *px, &mut queue_pick));
+                                row.col(|ui| { ui.label(dim(format!("{freq:>5}"))); });
+                            }
+                            None => {
+                                row.col(|_| {});
+                                row.col(|_| {});
+                                row.col(|_| {});
+                            }
+                        }
+                    });
+                });
+        });
+        // Totals: freq / lots per side around a bid-vs-offer pressure bar.
+        let (bf, bl) = bids.iter().fold((0i64, 0i64), |a, l| (a.0 + l.freq as i64, a.1 + l.lots));
+        let (of, ol) = offers.iter().fold((0i64, 0i64), |a, l| (a.0 + l.freq as i64, a.1 + l.lots));
+        ui.horizontal(|ui| {
+            ui.label(dim(idx::thousands(bf)));
+            ui.label(col(idx::thousands(bl), GREEN).strong());
+            let (resp, p) = ui.allocate_painter(Vec2::new(96.0, 8.0), Sense::hover());
+            let rect = resp.rect;
+            let split = rect.left() + rect.width() * (bl as f32 / (bl + ol).max(1) as f32);
+            p.rect_filled(
+                egui::Rect::from_min_max(rect.min, egui::Pos2::new(split, rect.bottom())),
+                2.0,
+                GREEN_DARK,
+            );
+            p.rect_filled(
+                egui::Rect::from_min_max(egui::Pos2::new(split, rect.top()), rect.max),
+                2.0,
+                RED_DARK,
+            );
+            ui.label(col(idx::thousands(ol), RED).strong());
+            ui.label(dim(idx::thousands(of)));
+        });
+        if let Some(price) = price_pick {
+            self.app.entry.price = price;
+        }
+        if let Some((side, price)) = queue_pick {
+            self.queue_view = Some((s, side, price));
+            self.app.entry.price = price;
+        }
+    }
+
+    /// Floating order ticket (B/S keys or the Buy/Sell buttons open it).
+    fn ticket_window(&mut self, ctx: &egui::Context) {
+        if !self.ticket_open {
+            return;
+        }
+        let mut open = true;
+        let side = self.app.entry.side;
+        let title = match side {
+            Side::Bid => "ORDER TICKET · BUY",
+            Side::Offer => "ORDER TICKET · SELL",
+        };
+        egui::Window::new(RichText::new(title).color(side_color(side)).strong())
+            .id(egui::Id::new("ticket_window"))
+            .open(&mut open)
+            .default_pos([420.0, 160.0])
+            .default_width(340.0)
+            .resizable(false)
+            .show(ctx, |ui| self.ticket(ui));
+        if !open {
+            self.ticket_open = false;
+        }
     }
 
     fn ticket(&mut self, ui: &mut egui::Ui) {
@@ -533,10 +752,16 @@ impl GuiApp {
         }
         let ticker = self.app.defs[s].ticker;
         let name = self.app.defs[s].name;
+        let lev = self.app.defs[s].leverage;
         section(ui, "ORDER TICKET");
         ui.horizontal(|ui| {
             ui.label(col(ticker, WHITE).strong().size(14.0));
             ui.label(dim(name));
+            if lev > 1 {
+                ui.label(col(format!("⚡{lev}x margin"), CYAN));
+            } else {
+                ui.label(dim("cash only"));
+            }
         });
 
         let enabled = self.app.mode != Mode::Ended;
@@ -654,6 +879,13 @@ impl GuiApp {
                 ui.label(dim("Value"));
                 ui.label(col(idx::thousands(value), WHITE));
                 ui.label(dim(format!("fee {}", idx::thousands(fee))));
+                if e.side == Side::Bid && lev > 1 {
+                    // Margin: only value/leverage of cash is committed up front.
+                    ui.label(col(
+                        format!("cash {}", idx::thousands(margin_cash(value, lev) + fee)),
+                        CYAN,
+                    ));
+                }
             });
             // submit
             let side = self.app.entry.side;
@@ -851,16 +1083,17 @@ impl GuiApp {
             .frame(egui::Frame::default().fill(BG).inner_margin(Margin::same(8)))
             .show(ctx, |ui| {
                 let s = self.app.selected;
-                let (ticker, name) = (self.app.defs[s].ticker, self.app.defs[s].name);
-
-                // stats block
+                let d = &self.app.defs[s];
                 {
                     let m = &self.app.markets[s];
                     let chg = m.change();
                     let arrow = if chg > 0 { "▲" } else if chg < 0 { "▼" } else { "•" };
                     ui.horizontal(|ui| {
-                        ui.label(col(ticker, WHITE).strong().size(17.0));
-                        ui.label(dim(name));
+                        ui.label(col(d.ticker, WHITE).strong().size(17.0));
+                        ui.label(dim(d.name));
+                        if d.leverage > 1 {
+                            ui.label(col(format!("⚡{}x", d.leverage), CYAN));
+                        }
                         ui.label(
                             RichText::new(format!(
                                 "{} {} {} ({:+.2}%)",
@@ -873,177 +1106,182 @@ impl GuiApp {
                             .strong()
                             .size(17.0),
                         );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(dim("O"));
-                        ui.label(fg(idx::thousands(m.open)));
-                        ui.label(dim("H"));
-                        ui.label(fg(idx::thousands(m.high)));
-                        ui.label(dim("L"));
-                        ui.label(fg(idx::thousands(m.low)));
-                        ui.label(dim("· VOL"));
-                        ui.label(fg(format!("{} lot", idx::compact(m.volume_lots))));
-                        ui.label(dim("VAL"));
-                        ui.label(fg(idx::compact(m.value)));
-                        ui.label(dim("FRQ"));
-                        ui.label(fg(idx::thousands(m.trade_count as i64)));
-                        ui.label(dim("· ARA"));
-                        ui.label(col(idx::thousands(m.upper_bound), GREEN));
-                        ui.label(dim("ARB"));
-                        ui.label(col(idx::thousands(m.lower_bound), RED));
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(dim("1m · session 09:00–09:10"));
+                        });
                     });
                 }
-                ui.separator();
+                let bottom_h = 232.0;
+                let chart_h = (ui.available_height() - bottom_h).max(120.0);
+                self.draw_chart(ui, s, chart_h);
+                ui.add_space(4.0);
 
-                // book halves
-                let bids = self.app.markets[s].levels(Side::Bid, BOOK_DEPTH);
-                let offers = self.app.markets[s].levels(Side::Offer, BOOK_DEPTH);
-                let mark = |side: Side, price: Price| -> bool {
-                    self.app.player.open_orders().any(|o| {
-                        o.stock == s && o.side == side && o.otype == OrdType::Limit && o.price == price
-                    })
-                };
-                let bid_rows: Vec<(String, String, String, Price)> = bids
+                // Portfolio metrics strip (Stockbit-style).
+                let p = &self.app.player;
+                let lasts = self.app.lasts();
+                let stock_val: i64 = p
+                    .positions
                     .iter()
-                    .map(|l| {
-                        (
-                            format!("{:>4}", l.freq),
-                            format!("{:>9}", idx::thousands(l.lots)),
-                            format!(
-                                "{}{:>7}",
-                                if mark(Side::Bid, l.price) { "•" } else { " " },
-                                idx::thousands(l.price)
-                            ),
-                            l.price,
-                        )
-                    })
-                    .collect();
-                let offer_rows: Vec<(String, String, String, Price)> = offers
-                    .iter()
-                    .map(|l| {
-                        (
-                            format!(
-                                "{:<7}{}",
-                                idx::thousands(l.price),
-                                if mark(Side::Offer, l.price) { "•" } else { " " }
-                            ),
-                            format!("{:>9}", idx::thousands(l.lots)),
-                            format!("{:>4}", l.freq),
-                            l.price,
-                        )
-                    })
-                    .collect();
-
-                // Row click (price area) only selects the level for the ticket;
-                // clicking the LOTS number opens the order-queue window.
-                let mut price_pick: Option<Price> = None;
-                let mut queue_pick: Option<(Side, Price)> = None;
-                let sel_bid: Option<Price> = match self.queue_view {
-                    Some((qs, Side::Bid, qp)) if qs == s => Some(qp),
-                    _ => None,
-                };
-                let sel_offer: Option<Price> = match self.queue_view {
-                    Some((qs, Side::Offer, qp)) if qs == s => Some(qp),
-                    _ => None,
-                };
-                ui.columns(2, |cols| {
-                    cols[0].push_id("bidbook", |ui| {
-                        TableBuilder::new(ui)
-                            .striped(true)
-                            .sense(Sense::click())
-                            .column(Column::exact(48.0))
-                            .column(Column::exact(96.0))
-                            .column(Column::remainder())
-                            .header(18.0, |mut h| {
-                                h.col(|ui| { ui.label(dim("FREQ")); });
-                                h.col(|ui| { ui.label(dim("LOTS")); });
-                                h.col(|ui| { ui.label(col("BID", GREEN).strong()); });
-                            })
-                            .body(|body| {
-                                body.rows(19.0, BOOK_DEPTH, |mut row| {
-                                    let r = row.index();
-                                    row.set_selected(
-                                        sel_bid.is_some()
-                                            && bid_rows.get(r).map(|x| x.3) == sel_bid,
-                                    );
-                                    if let Some((freq, lots, price, px)) = bid_rows.get(r) {
-                                        row.col(|ui| { ui.label(col(freq.clone(), DIM)); });
-                                        row.col(|ui| {
-                                            let resp = ui
-                                                .add(Label::new(fg(lots.clone())).sense(Sense::click()))
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .on_hover_text("view order queue");
-                                            if resp.clicked() {
-                                                queue_pick = Some((Side::Bid, *px));
-                                            }
-                                        });
-                                        row.col(|ui| { ui.label(col(price.clone(), GREEN).strong()); });
-                                        if row.response().clicked() {
-                                            price_pick = Some(*px);
-                                        }
-                                    } else {
-                                        row.col(|_| {});
-                                        row.col(|_| {});
-                                        row.col(|_| {});
-                                    }
-                                });
-                            });
+                    .zip(lasts)
+                    .map(|(pos, last)| pos.lots * SHARES_PER_LOT * last)
+                    .sum();
+                let debt: i64 = p.positions.iter().map(|x| x.debt).sum();
+                let pnl = self.app.pnl();
+                let pct = pnl as f64 * 100.0 / INITIAL_CASH as f64;
+                let equity = self.app.equity();
+                let metric = |ui: &mut egui::Ui, k: &str, v: String, c: Color32| {
+                    ui.vertical(|ui| {
+                        ui.label(dim(k));
+                        ui.label(col(v, c).strong());
                     });
-                    cols[1].push_id("offerbook", |ui| {
-                        TableBuilder::new(ui)
-                            .striped(true)
-                            .sense(Sense::click())
-                            .column(Column::remainder())
-                            .column(Column::exact(96.0))
-                            .column(Column::exact(48.0))
-                            .header(18.0, |mut h| {
-                                h.col(|ui| { ui.label(col("OFFER", RED).strong()); });
-                                h.col(|ui| { ui.label(dim("LOTS")); });
-                                h.col(|ui| { ui.label(dim("FREQ")); });
-                            })
-                            .body(|body| {
-                                body.rows(19.0, BOOK_DEPTH, |mut row| {
-                                    let r = row.index();
-                                    row.set_selected(
-                                        sel_offer.is_some()
-                                            && offer_rows.get(r).map(|x| x.3) == sel_offer,
-                                    );
-                                    if let Some((price, lots, freq, px)) = offer_rows.get(r) {
-                                        row.col(|ui| { ui.label(col(price.clone(), RED).strong()); });
-                                        row.col(|ui| {
-                                            let resp = ui
-                                                .add(Label::new(fg(lots.clone())).sense(Sense::click()))
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .on_hover_text("view order queue");
-                                            if resp.clicked() {
-                                                queue_pick = Some((Side::Offer, *px));
-                                            }
-                                        });
-                                        row.col(|ui| { ui.label(col(freq.clone(), DIM)); });
-                                        if row.response().clicked() {
-                                            price_pick = Some(*px);
-                                        }
-                                    } else {
-                                        row.col(|_| {});
-                                        row.col(|_| {});
-                                        row.col(|_| {});
-                                    }
-                                });
-                            });
-                    });
+                    ui.add_space(14.0);
+                };
+                ui.horizontal(|ui| {
+                    let p = &self.app.player;
+                    metric(ui, "BALANCE", idx::thousands(p.cash), FG);
+                    metric(ui, "LOCKED", idx::thousands(p.reserved_cash), FG);
+                    metric(ui, "STOCK", idx::thousands(stock_val), FG);
+                    metric(
+                        ui,
+                        "MARGIN DEBT",
+                        idx::thousands(debt),
+                        if debt > 0 { YELLOW } else { DIM },
+                    );
+                    metric(ui, "EQUITY", idx::thousands(equity), WHITE);
+                    metric(
+                        ui,
+                        "NET P&L",
+                        format!("{} ({:+.2}%)", idx::signed_thousands(pnl), pct),
+                        chg_color(pnl),
+                    );
+                    metric(ui, "FEES", idx::thousands(p.fees), DIM);
                 });
-                if let Some(price) = price_pick {
-                    self.app.entry.price = price;
-                }
-                if let Some((side, price)) = queue_pick {
-                    self.queue_view = Some((s, side, price));
-                    self.app.entry.price = price;
-                }
                 ui.add_space(2.0);
-                ui.label(dim(
-                    "click a price → set ticket price · click a LOTS number → open its order queue",
-                ));
+                ui.columns(2, |cols| {
+                    self.orders_table(&mut cols[0]);
+                    self.trades_table(&mut cols[1]);
+                });
             });
+    }
+
+    /// 1-minute candlestick + volume chart drawn with the raw painter.
+    fn draw_chart(&mut self, ui: &mut egui::Ui, s: usize, height: f32) {
+        let m: &Market = &self.app.markets[s];
+        let mut candles: Vec<Candle> = m.candles.clone();
+        if self.app.mode != Mode::Ended {
+            candles.push(m.forming_candle());
+        }
+        let (resp, painter) =
+            ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::hover());
+        painter.rect_filled(resp.rect, 3.0, PANEL);
+        let rect = resp.rect.shrink(6.0);
+        if candles.is_empty() {
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "waiting for the first candle",
+                FontId::proportional(12.0),
+                DIM,
+            );
+            return;
+        }
+
+        let slots = (SESSION_SECS / 60) as usize + 1; // 10 closed minutes + the forming one
+        let mut lo = m.prev_close.min(m.last);
+        let mut hi = m.prev_close.max(m.last);
+        for c in &candles {
+            lo = lo.min(c.low);
+            hi = hi.max(c.high);
+        }
+        let pad = (((hi - lo) as f64 * 0.08).ceil() as i64).max(idx::tick_size(hi));
+        let (lo, hi) = (lo - pad, hi + pad);
+        let span = (hi - lo).max(1) as f32;
+        let price_h = rect.height() * 0.78;
+        let vol_h = rect.height() * 0.16;
+        let vol_top = rect.bottom() - vol_h;
+        let y = |p: Price| rect.top() + (hi - p) as f32 / span * price_h;
+        let slot_w = rect.width() / slots as f32;
+
+        // Horizontal gridlines with price labels.
+        for k in 0..=4i64 {
+            let p = hi - (hi - lo) * k / 4;
+            let yy = y(p);
+            painter.line_segment(
+                [egui::Pos2::new(rect.left(), yy), egui::Pos2::new(rect.right(), yy)],
+                egui::Stroke::new(1.0, STRIPE),
+            );
+            painter.text(
+                egui::Pos2::new(rect.right() - 2.0, yy - 1.0),
+                Align2::RIGHT_BOTTOM,
+                idx::thousands(p),
+                FontId::monospace(9.0),
+                DIM,
+            );
+        }
+        // Previous close reference line.
+        let py = y(m.prev_close);
+        painter.line_segment(
+            [egui::Pos2::new(rect.left(), py), egui::Pos2::new(rect.right(), py)],
+            egui::Stroke::new(1.0, Color32::from_rgb(58, 64, 78)),
+        );
+
+        let max_vol = candles.iter().map(|c| c.vol).max().unwrap_or(1).max(1);
+        for (i, c) in candles.iter().enumerate() {
+            let cx = rect.left() + (i as f32 + 0.5) * slot_w;
+            let bw = (slot_w * 0.55).clamp(3.0, 26.0);
+            let color = match c.close.cmp(&c.open) {
+                std::cmp::Ordering::Greater => GREEN,
+                std::cmp::Ordering::Less => RED,
+                std::cmp::Ordering::Equal => DIM,
+            };
+            painter.line_segment(
+                [egui::Pos2::new(cx, y(c.high)), egui::Pos2::new(cx, y(c.low))],
+                egui::Stroke::new(1.0, color),
+            );
+            let top = y(c.open.max(c.close));
+            let bot = y(c.open.min(c.close)).max(top + 1.0);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::Pos2::new(cx - bw / 2.0, top),
+                    egui::Pos2::new(cx + bw / 2.0, bot),
+                ),
+                1.0,
+                color,
+            );
+            // Volume bar.
+            let vh = vol_h * c.vol as f32 / max_vol as f32;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::Pos2::new(cx - bw / 2.0, vol_top + vol_h - vh),
+                    egui::Pos2::new(cx + bw / 2.0, vol_top + vol_h),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 96),
+            );
+            // Minute labels above the volume strip.
+            if i % 2 == 1 {
+                painter.text(
+                    egui::Pos2::new(cx, vol_top - 2.0),
+                    Align2::CENTER_BOTTOM,
+                    format!("09:{:02}", i + 1),
+                    FontId::monospace(9.0),
+                    DIM,
+                );
+            }
+        }
+        // Last price marker.
+        let ly = y(m.last);
+        painter.line_segment(
+            [egui::Pos2::new(rect.left(), ly), egui::Pos2::new(rect.right(), ly)],
+            egui::Stroke::new(1.0, FOCUS),
+        );
+        painter.text(
+            egui::Pos2::new(rect.left() + 2.0, ly - 2.0),
+            Align2::LEFT_BOTTOM,
+            idx::thousands(m.last),
+            FontId::monospace(10.0),
+            FOCUS,
+        );
     }
 
     /// Floating sub-window showing the live order queue at a picked level.
@@ -1170,27 +1408,6 @@ impl GuiApp {
 
     // ---- bottom: tapes ----
 
-    fn tapes(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("tapes")
-            .exact_height(200.0)
-            .frame(egui::Frame::default().fill(PANEL).inner_margin(Margin::symmetric(8, 4)))
-            .show(ctx, |ui| {
-                let s = self.app.selected;
-                let show = self.revealed();
-                let stock_rows = tape_rows(
-                    &self.app,
-                    self.app.markets[s].tape.iter().rev().take(48),
-                    show,
-                );
-                let global_rows =
-                    tape_rows(&self.app, self.app.global_tape.iter().rev().take(48), show);
-                let stock_title = format!("TAPE · {}", self.app.defs[s].ticker);
-                ui.columns(2, |cols| {
-                    draw_tape(&mut cols[0], &stock_title, "tape_stock", &stock_rows, false);
-                    draw_tape(&mut cols[1], "TAPE · ALL", "tape_all", &global_rows, true);
-                });
-            });
-    }
 
     fn summary_window(&mut self, ctx: &egui::Context) {
         if !self.post.summary {
@@ -1710,5 +1927,14 @@ fn avg_px(val: i64, lots: Lots) -> String {
         "—".into()
     } else {
         idx::thousands(val / (lots * SHARES_PER_LOT))
+    }
+}
+
+/// IDX price coloring vs previous close: up green, down red, unchanged yellow.
+fn px_color(prev: Price, p: Price) -> Color32 {
+    match p.cmp(&prev) {
+        std::cmp::Ordering::Greater => GREEN,
+        std::cmp::Ordering::Less => RED,
+        std::cmp::Ordering::Equal => YELLOW,
     }
 }

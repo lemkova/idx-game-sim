@@ -8,13 +8,14 @@ use rand::SeedableRng;
 use crate::agents::AgentSet;
 use crate::idx;
 use crate::market::{stock_defs, Market, StockDef};
-use crate::player::{OrderStatus, Player, PlayerOrder, INITIAL_CASH};
+use crate::player::{margin_cash, OrderStatus, Player, PlayerOrder, INITIAL_CASH};
 use crate::types::{
     Lots, OrdType, OwnerId, Price, Side, Trade, BROKER_PLAYER, SHARES_PER_LOT,
 };
 
 pub const TICKS_PER_SEC: u64 = 10;
 pub const SESSION_SECS: u64 = 600; // 10 minute session
+pub const CANDLE_TICKS: u64 = 60 * TICKS_PER_SEC; // 1-minute chart candles
 pub const WARMUP_TICKS: u64 = 200;
 pub const GLOBAL_TAPE_CAP: usize = 800;
 pub const BOOK_DEPTH: usize = 10;
@@ -140,6 +141,11 @@ impl App {
         let tick = self.tick;
         self.agents.step(&mut self.markets, tick, &mut self.rng);
         self.drain_events();
+        if self.elapsed_ticks() % CANDLE_TICKS == 0 {
+            for m in &mut self.markets {
+                m.roll_candle();
+            }
+        }
         if self.elapsed_ticks() >= SESSION_SECS * TICKS_PER_SEC {
             self.end_session();
         }
@@ -169,7 +175,8 @@ impl App {
             let evs: Vec<Trade> = self.markets[s].events.drain(..).collect();
             for t in evs {
                 if t.buyer == OwnerId::Player {
-                    self.player.buy_fill(s, t.buy_oid, t.price, t.lots, t.ts);
+                    self.player
+                        .buy_fill(s, t.buy_oid, t.price, t.lots, t.ts, self.defs[s].leverage);
                 }
                 if t.seller == OwnerId::Player {
                     self.player.sell_fill(s, t.sell_oid, t.price, t.lots, t.ts);
@@ -265,7 +272,8 @@ impl App {
                 match side {
                     Side::Bid => {
                         let value = lots * SHARES_PER_LOT * price;
-                        let lock = value + idx::fee_buy(value);
+                        let lock =
+                            margin_cash(value, self.defs[s].leverage) + idx::fee_buy(value);
                         if self.player.cash < lock {
                             self.toast_err(format!(
                                 "Insufficient cash: need {}",
@@ -350,7 +358,7 @@ impl App {
                     return;
                 }
                 if side == Side::Bid {
-                    let cost = value + idx::fee_buy(value);
+                    let cost = margin_cash(value, self.defs[s].leverage) + idx::fee_buy(value);
                     if self.player.cash < cost {
                         self.toast_err(format!("Insufficient cash: need {}", idx::thousands(cost)));
                         return;

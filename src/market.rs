@@ -4,7 +4,9 @@ use std::collections::VecDeque;
 
 use crate::book::{LevelView, OrderBook};
 use crate::idx;
-use crate::types::{Lots, Order, OwnerId, Price, Side, SubmitReport, Trade, SHARES_PER_LOT};
+use crate::types::{
+    AgentKind, Lots, Order, OwnerId, Price, Side, SubmitReport, Trade, SHARES_PER_LOT,
+};
 
 pub const TAPE_CAP: usize = 600;
 
@@ -49,6 +51,8 @@ pub struct StockDef {
     pub ticker: &'static str,
     pub name: &'static str,
     pub prev_close: Price,
+    /// Margin multiplier by liquidity tier: blue chips lever up, gorengan trade cash-only (1x).
+    pub leverage: i64,
     pub persona: Persona,
 }
 
@@ -58,6 +62,7 @@ pub fn stock_defs() -> [StockDef; 4] {
             ticker: "BNKA",
             name: "Bank Nusantara Karya",
             prev_close: 9_750,
+            leverage: 4,
             persona: Persona {
                 lp_levels: 6,
                 lp_lots_min: 200,
@@ -83,6 +88,7 @@ pub fn stock_defs() -> [StockDef; 4] {
             ticker: "TLCO",
             name: "Telekom Cakrawala",
             prev_close: 3_180,
+            leverage: 3,
             persona: Persona {
                 lp_levels: 5,
                 lp_lots_min: 100,
@@ -112,6 +118,7 @@ pub fn stock_defs() -> [StockDef; 4] {
             ticker: "NIKL",
             name: "Nikel Lautan",
             prev_close: 1_545,
+            leverage: 2,
             persona: Persona {
                 lp_levels: 5,
                 lp_lots_min: 80,
@@ -141,6 +148,7 @@ pub fn stock_defs() -> [StockDef; 4] {
             ticker: "SAWT",
             name: "Sawit Tunas Abadi",
             prev_close: 157,
+            leverage: 1,
             persona: Persona {
                 lp_levels: 3,
                 lp_lots_min: 200,
@@ -169,6 +177,22 @@ pub fn stock_defs() -> [StockDef; 4] {
     ]
 }
 
+/// One chart candle (1 sim-minute in the GUI).
+#[derive(Clone, Copy, Debug)]
+pub struct Candle {
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub close: Price,
+    pub vol: Lots,
+}
+
+impl Candle {
+    fn flat(price: Price) -> Self {
+        Candle { open: price, high: price, low: price, close: price, vol: 0 }
+    }
+}
+
 // ---- Market ----
 
 pub struct Market {
@@ -187,6 +211,10 @@ pub struct Market {
     pub tape: VecDeque<Trade>,
     pub log: Vec<Trade>, // full-session trade log (uncapped) for post-close reports
     pub events: Vec<Trade>, // drained by the app every tick
+    pub candles: Vec<Candle>, // closed 1-minute candles for the chart
+    cur_candle: Option<Candle>,
+    pub f_buy_val: i64,  // rupiah bought by foreign desks this session
+    pub f_sell_val: i64, // rupiah sold by foreign desks this session
     next_order_id: u64,
 }
 
@@ -209,6 +237,10 @@ impl Market {
             tape: VecDeque::new(),
             log: Vec::new(),
             events: Vec::new(),
+            candles: Vec::new(),
+            cur_candle: None,
+            f_buy_val: 0,
+            f_sell_val: 0,
             next_order_id: 1,
         }
     }
@@ -340,6 +372,21 @@ impl Market {
         self.tape.clear();
         self.log.clear();
         self.events.clear();
+        self.candles.clear();
+        self.cur_candle = None;
+        self.f_buy_val = 0;
+        self.f_sell_val = 0;
+    }
+
+    /// Close the forming candle (called by the app on every minute boundary).
+    pub fn roll_candle(&mut self) {
+        let c = self.cur_candle.take().unwrap_or_else(|| Candle::flat(self.last));
+        self.candles.push(c);
+    }
+
+    /// The candle currently forming, or a flat placeholder at the last price.
+    pub fn forming_candle(&self) -> Candle {
+        self.cur_candle.unwrap_or_else(|| Candle::flat(self.last))
     }
 
     fn alloc_oid(&mut self) -> u64 {
@@ -421,6 +468,25 @@ impl Market {
                 self.volume_lots += ex;
                 self.value += ex * SHARES_PER_LOT * px;
                 self.trade_count += 1;
+                let val = ex * SHARES_PER_LOT * px;
+                if buyer == OwnerId::Agent(AgentKind::Foreign) {
+                    self.f_buy_val += val;
+                }
+                if seller == OwnerId::Agent(AgentKind::Foreign) {
+                    self.f_sell_val += val;
+                }
+                match &mut self.cur_candle {
+                    Some(c) => {
+                        c.high = c.high.max(px);
+                        c.low = c.low.min(px);
+                        c.close = px;
+                        c.vol += ex;
+                    }
+                    None => {
+                        self.cur_candle =
+                            Some(Candle { open: px, high: px, low: px, close: px, vol: ex });
+                    }
+                }
                 self.tape.push_back(t);
                 if self.tape.len() > TAPE_CAP {
                     self.tape.pop_front();
