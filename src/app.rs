@@ -229,11 +229,11 @@ impl App {
     }
 
 
-    fn toast_ok(&mut self, msg: String) {
+    pub fn toast_ok(&mut self, msg: String) {
         self.toast = Some((msg, false));
     }
 
-    fn toast_err(&mut self, msg: impl Into<String>) {
+    pub fn toast_err(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), true));
     }
 

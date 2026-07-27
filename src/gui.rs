@@ -10,8 +10,12 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::app::{App, Mode, BOOK_DEPTH, TICKS_PER_SEC};
 use crate::idx;
+use crate::market::StockDef;
 use crate::player::{OrderStatus, INITIAL_CASH};
-use crate::types::{AgentKind, OrdType, OwnerId, Price, Side, SHARES_PER_LOT};
+use crate::types::{
+    AgentKind, Lots, OrdType, OwnerId, Price, Side, Trade, BROKERS_DOMESTIC, BROKERS_FOREIGN,
+    BROKERS_LP, BROKER_PLAYER, SHARES_PER_LOT,
+};
 
 // ---- palette (mirrors the old terminal theme) ----
 const BG: Color32 = Color32::from_rgb(9, 12, 17);
@@ -49,6 +53,30 @@ fn owner_color(owner: OwnerId) -> Color32 {
         OwnerId::Agent(AgentKind::Foreign) => YELLOW,
         OwnerId::Agent(AgentKind::Domestic) => MAGENTA,
         OwnerId::Agent(AgentKind::Retail) => FG,
+    }
+}
+
+/// Color a broker code by the desk behind it — only meaningful when revealed.
+fn broker_color(code: &str) -> Color32 {
+    if code == BROKER_PLAYER {
+        CYAN
+    } else if BROKERS_FOREIGN.contains(&code) {
+        YELLOW
+    } else if BROKERS_DOMESTIC.contains(&code) {
+        MAGENTA
+    } else if BROKERS_LP.contains(&code) {
+        DIM
+    } else {
+        FG
+    }
+}
+
+/// IDX investor-type flag: foreign desks are F, everything else trades domestic.
+fn investor_type(code: &str) -> &'static str {
+    if BROKERS_FOREIGN.contains(&code) {
+        "F"
+    } else {
+        "D"
     }
 }
 
@@ -132,6 +160,24 @@ pub struct GuiApp {
     next_tick: Instant,
     ticket_stock: usize,
     queue_view: Option<(usize, Side, Price)>, // (stock, side, price) under inspection
+    admin_open: bool,
+    admin_balance: String, // balance input buffer for the admin window
+    show_brokers: bool,    // admin override: reveal broker codes/investor type intraday
+    was_ended: bool,       // last frame's "session ended" state, for edge detection
+    post: PostClose,
+}
+
+/// Post-close report windows: which are open, per-window stock selection.
+#[derive(Default)]
+struct PostClose {
+    summary: bool,
+    broker: bool,
+    broker_stock: usize,
+    done: bool,
+    done_stock: usize,
+    market: bool,
+    /// Broker aggregation cache for the currently selected stock.
+    cache: Option<(usize, Vec<BrokerRow>)>,
 }
 
 impl GuiApp {
@@ -143,7 +189,18 @@ impl GuiApp {
             next_tick: Instant::now() + tick_dur(),
             ticket_stock: 0,
             queue_view: None,
+            admin_open: false,
+            admin_balance: String::new(),
+            show_brokers: false,
+            was_ended: false,
+            post: PostClose::default(),
         }
+    }
+
+    /// Broker codes / investor types are anonymized intraday (real IDX rules);
+    /// visible when the admin toggle is on or after the session closes.
+    fn revealed(&self) -> bool {
+        self.show_brokers || self.app.mode == Mode::Ended
     }
 }
 
@@ -168,6 +225,13 @@ impl eframe::App for GuiApp {
 
         self.hotkeys(ctx);
 
+        // Edge-detect the close: pop the session summary once, with fresh state.
+        let ended = self.app.mode == Mode::Ended;
+        if ended && !self.was_ended {
+            self.post = PostClose { summary: true, ..PostClose::default() };
+        }
+        self.was_ended = ended;
+
         self.header(ctx);
         self.status_bar(ctx);
         self.tapes(ctx);
@@ -175,9 +239,13 @@ impl eframe::App for GuiApp {
         self.right_panel(ctx);
         self.center_panel(ctx);
         self.queue_window(ctx);
+        self.admin_window(ctx);
 
-        if self.app.mode == Mode::Ended {
+        if ended {
             self.summary_window(ctx);
+            self.broker_summary_window(ctx);
+            self.done_detail_window(ctx);
+            self.market_summary_window(ctx);
         }
     }
 }
@@ -206,6 +274,7 @@ impl GuiApp {
                 self.app.restart();
                 self.next_tick = Instant::now() + tick_dur();
                 self.queue_view = None;
+                self.post = PostClose::default();
             }
         });
     }
@@ -260,12 +329,24 @@ impl GuiApp {
                             app.restart();
                             self.next_tick = Instant::now() + tick_dur();
                             self.queue_view = None;
+                            self.post = PostClose::default();
                         }
                         if app.mode != Mode::Ended {
                             let label = if app.mode == Mode::Paused { "Resume" } else { "Pause" };
                             if ui.add(Button::new(fg(label)).fill(BTN_DARK)).clicked() {
                                 app.toggle_pause();
                             }
+                        }
+                        if ui.add(Button::new(fg("Admin")).fill(BTN_DARK)).clicked() {
+                            self.admin_open = !self.admin_open;
+                            if self.admin_open {
+                                self.admin_balance = app.player.cash.to_string();
+                            }
+                        }
+                        if app.mode == Mode::Ended
+                            && ui.add(Button::new(fg("Summary")).fill(BTN_DARK)).clicked()
+                        {
+                            self.post.summary = true;
                         }
                     });
                 });
@@ -972,6 +1053,7 @@ impl GuiApp {
             kind: &'static str,
             color: Color32,
         }
+        let show = self.revealed();
         let (rows, total, freq) = {
             let m = &self.app.markets[qs];
             match m.book.level_queue(side, price) {
@@ -983,7 +1065,11 @@ impl GuiApp {
                         .take(300)
                         .map(|(i, o)| QRow {
                             pos: i + 1,
-                            brk: o.broker,
+                            brk: if show || o.owner == OwnerId::Player {
+                                o.broker
+                            } else {
+                                "··"
+                            },
                             lots: idx::thousands(o.remaining),
                             age: format!(
                                 "{}s",
@@ -991,12 +1077,17 @@ impl GuiApp {
                             ),
                             kind: match o.owner {
                                 OwnerId::Player => "YOU",
+                                _ if !show => "",
                                 OwnerId::Agent(AgentKind::Lp) => "market maker",
                                 OwnerId::Agent(AgentKind::Foreign) => "foreign",
                                 OwnerId::Agent(AgentKind::Domestic) => "domestic",
                                 OwnerId::Agent(AgentKind::Retail) => "retail",
                             },
-                            color: owner_color(o.owner),
+                            color: if show || o.owner == OwnerId::Player {
+                                owner_color(o.owner)
+                            } else {
+                                FG
+                            },
                         })
                         .collect();
                     (rows, total, q.len())
@@ -1074,13 +1165,14 @@ impl GuiApp {
             .frame(egui::Frame::default().fill(PANEL).inner_margin(Margin::symmetric(8, 4)))
             .show(ctx, |ui| {
                 let s = self.app.selected;
+                let show = self.revealed();
                 let stock_rows = tape_rows(
                     &self.app,
                     self.app.markets[s].tape.iter().rev().take(48),
-                    false,
+                    show,
                 );
                 let global_rows =
-                    tape_rows(&self.app, self.app.global_tape.iter().rev().take(48), true);
+                    tape_rows(&self.app, self.app.global_tape.iter().rev().take(48), show);
                 let stock_title = format!("TAPE · {}", self.app.defs[s].ticker);
                 ui.columns(2, |cols| {
                     draw_tape(&mut cols[0], &stock_title, "tape_stock", &stock_rows, false);
@@ -1090,6 +1182,10 @@ impl GuiApp {
     }
 
     fn summary_window(&mut self, ctx: &egui::Context) {
+        if !self.post.summary {
+            return;
+        }
+        let mut open = true;
         let equity = self.app.equity();
         let pnl = self.app.pnl();
         let pct = pnl as f64 * 100.0 / INITIAL_CASH as f64;
@@ -1106,6 +1202,7 @@ impl GuiApp {
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
+            .open(&mut open)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
@@ -1137,16 +1234,330 @@ impl GuiApp {
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
+                    if ui.add(Button::new(fg("Broker summary")).fill(BTN_DARK)).clicked() {
+                        self.post.broker = true;
+                    }
+                    if ui.add(Button::new(fg("Done detail")).fill(BTN_DARK)).clicked() {
+                        self.post.done = true;
+                    }
+                    if ui.add(Button::new(fg("Market summary")).fill(BTN_DARK)).clicked() {
+                        self.post.market = true;
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
                     if ui.add(Button::new(col("New session", FOCUS).strong()).fill(BTN_DARK)).clicked() {
                         self.app.restart();
                         self.next_tick = Instant::now() + tick_dur();
                         self.queue_view = None;
+                        self.post = PostClose::default();
                     }
                     if ui.add(Button::new(fg("Quit")).fill(BTN_DARK)).clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
             });
+        if !open {
+            self.post.summary = false;
+        }
+    }
+
+    /// Floating admin window: balance override and market-transparency toggle.
+    fn admin_window(&mut self, ctx: &egui::Context) {
+        if !self.admin_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(RichText::new("ADMIN").color(FOCUS).strong())
+            .id(egui::Id::new("admin_window"))
+            .open(&mut open)
+            .default_pos([380.0, 120.0])
+            .default_width(330.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                section(ui, "BALANCE");
+                egui::Grid::new("admin_cash").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+                    ui.label(dim("free cash"));
+                    ui.label(fg(idx::thousands(self.app.player.cash)));
+                    ui.end_row();
+                    ui.label(dim("reserved (open bids)"));
+                    ui.label(fg(idx::thousands(self.app.player.reserved_cash)));
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.admin_balance)
+                            .desired_width(150.0)
+                            .hint_text("new free cash (Rp)"),
+                    );
+                    let submit = ui.add(Button::new(fg("Set")).fill(BTN_DARK)).clicked()
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                    if submit {
+                        let digits: String = self
+                            .admin_balance
+                            .chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect();
+                        match digits.parse::<i64>() {
+                            Ok(v) => {
+                                self.app.player.cash = v;
+                                self.app.toast_ok(format!(
+                                    "admin: free cash set to {}",
+                                    idx::thousands(v)
+                                ));
+                            }
+                            Err(_) => self.app.toast_err("admin: enter a valid amount"),
+                        }
+                    }
+                });
+                ui.label(dim("sets free cash; reserved cash on open bids is untouched"));
+                ui.add_space(6.0);
+                section(ui, "DISPLAY");
+                ui.checkbox(&mut self.show_brokers, fg("Show broker codes & investor type"));
+                ui.label(dim("off = real intraday tape: codes hidden until the close"));
+            });
+        if !open {
+            self.admin_open = false;
+        }
+    }
+
+    /// Post-close broker summary (per stock): buy/sell volume, value, average.
+    fn broker_summary_window(&mut self, ctx: &egui::Context) {
+        if !self.post.broker {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(RichText::new("BROKER SUMMARY · POST CLOSE").color(FOCUS).strong())
+            .id(egui::Id::new("broker_summary_window"))
+            .open(&mut open)
+            .default_pos([40.0, 110.0])
+            .default_width(620.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                stock_tabs(ui, &self.app.defs, &mut self.post.broker_stock);
+                let s = self.post.broker_stock;
+                if self.post.cache.as_ref().map(|(cs, _)| *cs) != Some(s) {
+                    self.post.cache = Some((s, broker_summary(&self.app.markets[s].log)));
+                }
+                let rows = &self.post.cache.as_ref().unwrap().1;
+                ui.separator();
+                if rows.is_empty() {
+                    ui.label(dim("── no trades this session ──"));
+                    return;
+                }
+                ui.push_id("broker_summary_table", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .column(Column::exact(36.0))
+                        .column(Column::exact(22.0))
+                        .column(Column::exact(70.0))
+                        .column(Column::exact(84.0))
+                        .column(Column::exact(60.0))
+                        .column(Column::exact(70.0))
+                        .column(Column::exact(84.0))
+                        .column(Column::exact(60.0))
+                        .column(Column::remainder())
+                        .min_scrolled_height(60.0)
+                        .max_scroll_height(420.0)
+                        .header(18.0, |mut h| {
+                            for t in
+                                ["BRK", "T", "B.VOL", "B.VAL", "B.AVG", "S.VOL", "S.VAL", "S.AVG", "NET LOT"]
+                            {
+                                h.col(|ui| { ui.label(dim(t)); });
+                            }
+                        })
+                        .body(|body| {
+                            body.rows(18.0, rows.len(), |mut row| {
+                                let r = &rows[row.index()];
+                                let strong = r.code == BROKER_PLAYER;
+                                let style = |t: RichText| if strong { t.strong() } else { t };
+                                row.col(|ui| { ui.label(style(col(r.code, broker_color(r.code)))); });
+                                row.col(|ui| { ui.label(dim(investor_type(r.code))); });
+                                row.col(|ui| { ui.label(style(col(idx::thousands(r.bvol), GREEN))); });
+                                row.col(|ui| { ui.label(style(col(idx::compact(r.bval), GREEN))); });
+                                row.col(|ui| { ui.label(dim(avg_px(r.bval, r.bvol))); });
+                                row.col(|ui| { ui.label(style(col(idx::thousands(r.svol), RED))); });
+                                row.col(|ui| { ui.label(style(col(idx::compact(r.sval), RED))); });
+                                row.col(|ui| { ui.label(dim(avg_px(r.sval, r.svol))); });
+                                let net = r.bvol - r.svol;
+                                row.col(|ui| {
+                                    ui.label(style(col(idx::signed_thousands(net), chg_color(net))));
+                                });
+                            });
+                        });
+                });
+            });
+        if !open {
+            self.post.broker = false;
+        }
+    }
+
+    /// Post-close done detail: the complete session tape with broker codes.
+    fn done_detail_window(&mut self, ctx: &egui::Context) {
+        if !self.post.done {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(RichText::new("DONE DETAIL · POST CLOSE").color(FOCUS).strong())
+            .id(egui::Id::new("done_detail_window"))
+            .open(&mut open)
+            .default_pos([420.0, 110.0])
+            .default_width(430.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                stock_tabs(ui, &self.app.defs, &mut self.post.done_stock);
+                let s = self.post.done_stock;
+                let log = &self.app.markets[s].log;
+                ui.separator();
+                if log.is_empty() {
+                    ui.label(dim("── no trades this session ──"));
+                    return;
+                }
+                ui.label(dim(format!(
+                    "{} trades · newest first",
+                    idx::thousands(log.len() as i64)
+                )));
+                ui.push_id("done_detail_table", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .column(Column::exact(64.0))
+                        .column(Column::exact(84.0))
+                        .column(Column::exact(70.0))
+                        .column(Column::exact(56.0))
+                        .column(Column::remainder())
+                        .min_scrolled_height(60.0)
+                        .max_scroll_height(440.0)
+                        .header(18.0, |mut h| {
+                            for t in ["TIME", "PRICE", "LOTS", "BUY", "SELL"] {
+                                h.col(|ui| { ui.label(dim(t)); });
+                            }
+                        })
+                        .body(|body| {
+                            body.rows(18.0, log.len(), |mut row| {
+                                let t = &log[log.len() - 1 - row.index()];
+                                let (arrow, c) = match t.aggressor {
+                                    Side::Bid => ("▲", GREEN),
+                                    Side::Offer => ("▼", RED),
+                                };
+                                let you = t.buyer == OwnerId::Player
+                                    || t.seller == OwnerId::Player;
+                                let style = |txt: RichText| if you { txt.strong() } else { txt };
+                                row.col(|ui| { ui.label(dim(self.app.clock_of_tick(t.ts))); });
+                                row.col(|ui| {
+                                    ui.label(style(col(
+                                        format!("{:>7} {arrow}", idx::thousands(t.price)),
+                                        c,
+                                    )));
+                                });
+                                row.col(|ui| {
+                                    ui.label(style(fg(format!("{:>8}", idx::thousands(t.lots)))));
+                                });
+                                row.col(|ui| {
+                                    ui.label(style(col(t.buy_broker, broker_color(t.buy_broker))));
+                                });
+                                row.col(|ui| {
+                                    ui.label(style(col(t.sell_broker, broker_color(t.sell_broker))));
+                                });
+                            });
+                        });
+                });
+            });
+        if !open {
+            self.post.done = false;
+        }
+    }
+
+    /// Post-close market summary: OHLC, change, volume, value, frequency per stock.
+    fn market_summary_window(&mut self, ctx: &egui::Context) {
+        if !self.post.market {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(RichText::new("MARKET SUMMARY · POST CLOSE").color(FOCUS).strong())
+            .id(egui::Id::new("market_summary_window"))
+            .open(&mut open)
+            .default_pos([120.0, 320.0])
+            .default_width(780.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let (mut tvol, mut tval, mut tfreq) = (0i64, 0i64, 0u64);
+                let (mut up, mut down, mut flat) = (0u32, 0u32, 0u32);
+                for m in &self.app.markets {
+                    tvol += m.volume_lots;
+                    tval += m.value;
+                    tfreq += m.trade_count;
+                    match m.change().cmp(&0) {
+                        std::cmp::Ordering::Greater => up += 1,
+                        std::cmp::Ordering::Less => down += 1,
+                        std::cmp::Ordering::Equal => flat += 1,
+                    }
+                }
+                ui.push_id("market_summary_table", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .column(Column::exact(52.0))
+                        .column(Column::exact(62.0))
+                        .column(Column::exact(62.0))
+                        .column(Column::exact(62.0))
+                        .column(Column::exact(62.0))
+                        .column(Column::exact(62.0))
+                        .column(Column::exact(110.0))
+                        .column(Column::exact(80.0))
+                        .column(Column::exact(72.0))
+                        .column(Column::remainder())
+                        .header(18.0, |mut h| {
+                            for t in
+                                ["STOCK", "PREV", "OPEN", "HIGH", "LOW", "CLOSE", "+/-", "VOL", "VALUE", "FREQ"]
+                            {
+                                h.col(|ui| { ui.label(dim(t)); });
+                            }
+                        })
+                        .body(|body| {
+                            body.rows(18.0, self.app.defs.len(), |mut row| {
+                                let i = row.index();
+                                let d = &self.app.defs[i];
+                                let m = &self.app.markets[i];
+                                let chg = m.change();
+                                row.col(|ui| { ui.label(fg(d.ticker).strong()); });
+                                row.col(|ui| { ui.label(dim(idx::thousands(m.prev_close))); });
+                                row.col(|ui| { ui.label(fg(idx::thousands(m.open))); });
+                                row.col(|ui| { ui.label(col(idx::thousands(m.high), GREEN)); });
+                                row.col(|ui| { ui.label(col(idx::thousands(m.low), RED)); });
+                                row.col(|ui| { ui.label(col(idx::thousands(m.last), WHITE).strong()); });
+                                row.col(|ui| {
+                                    ui.label(col(
+                                        format!(
+                                            "{} ({:+.2}%)",
+                                            idx::signed_thousands(chg),
+                                            m.change_pct()
+                                        ),
+                                        chg_color(chg),
+                                    ));
+                                });
+                                row.col(|ui| { ui.label(fg(idx::thousands(m.volume_lots))); });
+                                row.col(|ui| { ui.label(fg(idx::compact(m.value))); });
+                                row.col(|ui| { ui.label(fg(idx::thousands(m.trade_count as i64))); });
+                            });
+                        });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(dim("total"));
+                    ui.label(fg(format!("{} lot", idx::thousands(tvol))));
+                    ui.label(dim("·"));
+                    ui.label(fg(idx::compact(tval)));
+                    ui.label(dim("·"));
+                    ui.label(fg(format!("{} trades", idx::thousands(tfreq as i64))));
+                    ui.label(dim("▏"));
+                    ui.label(col(format!("▲ {up}"), GREEN));
+                    ui.label(col(format!("▼ {down}"), RED));
+                    ui.label(dim(format!("― {flat}")));
+                });
+            });
+        if !open {
+            self.post.market = false;
+        }
     }
 }
 
@@ -1162,13 +1573,26 @@ struct TapeRow {
 
 fn tape_rows<'a>(
     app: &App,
-    it: impl Iterator<Item = &'a crate::types::Trade>,
-    _global: bool,
+    it: impl Iterator<Item = &'a Trade>,
+    show_brokers: bool,
 ) -> Vec<TapeRow> {
     it.map(|t| {
         let (arrow, c) = match t.aggressor {
             Side::Bid => ("▲", GREEN),
             Side::Offer => ("▼", RED),
+        };
+        let buyer_you = t.buyer == OwnerId::Player;
+        let seller_you = t.seller == OwnerId::Player;
+        let brokers = if show_brokers {
+            format!("{}▸{}", t.buy_broker, t.sell_broker)
+        } else {
+            // Real intraday tape: counterparty codes hidden, only own fills marked.
+            match (buyer_you, seller_you) {
+                (true, true) => "YOU▸YOU".to_string(),
+                (true, false) => "YOU▸".to_string(),
+                (false, true) => "▸YOU".to_string(),
+                (false, false) => String::new(),
+            }
         };
         TapeRow {
             time: app.clock_of_tick(t.ts),
@@ -1176,8 +1600,8 @@ fn tape_rows<'a>(
             price: format!("{:>7} {arrow}", idx::thousands(t.price)),
             arrow_color: c,
             lots: format!("{:>8}", idx::thousands(t.lots)),
-            brokers: format!("{}▸{}", t.buy_broker, t.sell_broker),
-            player: t.buyer == OwnerId::Player || t.seller == OwnerId::Player,
+            brokers,
+            player: buyer_you || seller_you,
         }
     })
     .collect()
@@ -1217,4 +1641,63 @@ fn draw_tape(ui: &mut egui::Ui, title: &str, id: &str, rows: &[TapeRow], show_ti
                 });
             });
     });
+}
+
+/// Row of ticker tabs used by the post-close windows.
+fn stock_tabs(ui: &mut egui::Ui, defs: &[StockDef], sel: &mut usize) {
+    ui.horizontal(|ui| {
+        for (i, d) in defs.iter().enumerate() {
+            let txt = if *sel == i {
+                col(d.ticker, FOCUS).strong()
+            } else {
+                dim(d.ticker)
+            };
+            if ui.selectable_label(*sel == i, txt).clicked() {
+                *sel = i;
+            }
+        }
+    });
+}
+
+/// Per-broker aggregates over one stock's full-session trade log.
+struct BrokerRow {
+    code: &'static str,
+    bvol: Lots,
+    bval: i64,
+    svol: Lots,
+    sval: i64,
+}
+
+fn upsert<'a>(rows: &'a mut Vec<BrokerRow>, code: &'static str) -> &'a mut BrokerRow {
+    if let Some(i) = rows.iter().position(|r| r.code == code) {
+        &mut rows[i]
+    } else {
+        rows.push(BrokerRow { code, bvol: 0, bval: 0, svol: 0, sval: 0 });
+        rows.last_mut().unwrap()
+    }
+}
+
+/// IDX-style broker summary: both sides of every print, sorted by turnover.
+fn broker_summary(log: &[Trade]) -> Vec<BrokerRow> {
+    let mut rows: Vec<BrokerRow> = Vec::new();
+    for t in log {
+        let val = t.lots * SHARES_PER_LOT * t.price;
+        let b = upsert(&mut rows, t.buy_broker);
+        b.bvol += t.lots;
+        b.bval += val;
+        let s = upsert(&mut rows, t.sell_broker);
+        s.svol += t.lots;
+        s.sval += val;
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.bval + r.sval));
+    rows
+}
+
+/// Average price per share, "—" when nothing traded.
+fn avg_px(val: i64, lots: Lots) -> String {
+    if lots <= 0 {
+        "—".into()
+    } else {
+        idx::thousands(val / (lots * SHARES_PER_LOT))
+    }
 }

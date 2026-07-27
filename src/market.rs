@@ -185,6 +185,7 @@ pub struct Market {
     pub lower_bound: Price, // ARB
     pub upper_bound: Price, // ARA
     pub tape: VecDeque<Trade>,
+    pub log: Vec<Trade>, // full-session trade log (uncapped) for post-close reports
     pub events: Vec<Trade>, // drained by the app every tick
     next_order_id: u64,
 }
@@ -206,6 +207,7 @@ impl Market {
             lower_bound,
             upper_bound,
             tape: VecDeque::new(),
+            log: Vec::new(),
             events: Vec::new(),
             next_order_id: 1,
         }
@@ -336,6 +338,7 @@ impl Market {
         self.value = 0;
         self.trade_count = 0;
         self.tape.clear();
+        self.log.clear();
         self.events.clear();
     }
 
@@ -422,6 +425,7 @@ impl Market {
                 if self.tape.len() > TAPE_CAP {
                     self.tape.pop_front();
                 }
+                self.log.push(t);
                 self.events.push(t);
             }
         }
