@@ -233,6 +233,7 @@ impl eframe::App for GuiApp {
         self.was_ended = ended;
 
         self.header(ctx);
+        self.toolbar(ctx);
         self.status_bar(ctx);
         self.tapes(ctx);
         self.left_panel(ctx);
@@ -320,33 +321,43 @@ impl GuiApp {
                         Mode::Ended => ("CLOSED", RED),
                     };
                     ui.label(RichText::new(format!(" {state} ")).color(BG).background_color(sc).strong());
+                });
+            });
+    }
 
+    /// Toolbar under the header: session controls and tools.
+    fn toolbar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("toolbar")
+            .frame(egui::Frame::default().fill(PANEL).inner_margin(Margin::symmetric(10, 4)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if self.app.mode != Mode::Ended {
+                        let label = if self.app.mode == Mode::Paused { "Resume" } else { "Pause" };
+                        if ui.add(Button::new(fg(label)).fill(BTN_DARK)).clicked() {
+                            self.app.toggle_pause();
+                        }
+                        if ui.add(Button::new(col("End session", RED)).fill(BTN_DARK)).clicked() {
+                            self.app.end_session();
+                        }
+                    } else if ui.add(Button::new(fg("Summary")).fill(BTN_DARK)).clicked() {
+                        self.post.summary = true;
+                    }
+                    if ui.add(Button::new(fg("New session")).fill(BTN_DARK)).clicked() {
+                        self.app.restart();
+                        self.next_tick = Instant::now() + tick_dur();
+                        self.queue_view = None;
+                        self.post = PostClose::default();
+                    }
+                    ui.label(dim("▏"));
+                    if ui.add(Button::new(fg("Admin")).fill(BTN_DARK)).clicked() {
+                        self.admin_open = !self.admin_open;
+                        if self.admin_open {
+                            self.admin_balance = self.app.player.cash.to_string();
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if ui.add(Button::new(fg("Quit")).fill(BTN_DARK)).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if ui.add(Button::new(fg("New session")).fill(BTN_DARK)).clicked() {
-                            app.restart();
-                            self.next_tick = Instant::now() + tick_dur();
-                            self.queue_view = None;
-                            self.post = PostClose::default();
-                        }
-                        if app.mode != Mode::Ended {
-                            let label = if app.mode == Mode::Paused { "Resume" } else { "Pause" };
-                            if ui.add(Button::new(fg(label)).fill(BTN_DARK)).clicked() {
-                                app.toggle_pause();
-                            }
-                        }
-                        if ui.add(Button::new(fg("Admin")).fill(BTN_DARK)).clicked() {
-                            self.admin_open = !self.admin_open;
-                            if self.admin_open {
-                                self.admin_balance = app.player.cash.to_string();
-                            }
-                        }
-                        if app.mode == Mode::Ended
-                            && ui.add(Button::new(fg("Summary")).fill(BTN_DARK)).clicked()
-                        {
-                            self.post.summary = true;
                         }
                     });
                 });

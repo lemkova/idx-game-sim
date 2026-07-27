@@ -145,8 +145,12 @@ impl App {
         }
     }
 
-    fn end_session(&mut self) {
-        // Pull every open player order so the summary is clean.
+    /// End the session now (bell or user action): pull every open player
+    /// order so the summary is clean, then close the market.
+    pub fn end_session(&mut self) {
+        if self.mode == Mode::Ended {
+            return;
+        }
         let open: Vec<(usize, u64)> = self
             .player
             .open_orders()
