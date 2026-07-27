@@ -567,8 +567,10 @@ impl GuiApp {
         ui.separator();
 
         let prev = self.app.markets[s].prev_close;
-        let bids = self.app.markets[s].levels(Side::Bid, BOOK_DEPTH);
-        let offers = self.app.markets[s].levels(Side::Offer, BOOK_DEPTH);
+        // Fetch the whole book: 5 rows visible, the rest reachable by scroll,
+        // and the totals row covers every level, not just the visible ones.
+        let bids = self.app.markets[s].levels(Side::Bid, usize::MAX);
+        let offers = self.app.markets[s].levels(Side::Offer, usize::MAX);
         let mark = |side: Side, price: Price| -> bool {
             self.app.player.open_orders().any(|o| {
                 o.stock == s && o.side == side && o.otype == OrdType::Limit && o.price == price
@@ -590,6 +592,7 @@ impl GuiApp {
         };
         let bid_rows: Vec<_> = bids.iter().map(|l| row_of(l, Side::Bid)).collect();
         let offer_rows: Vec<_> = offers.iter().map(|l| row_of(l, Side::Offer)).collect();
+        let nrows = bid_rows.len().max(offer_rows.len()).max(BOOK_DEPTH);
 
         let mut price_pick: Option<Price> = None;
         let mut queue_pick: Option<(Side, Price)> = None;
@@ -602,13 +605,15 @@ impl GuiApp {
                 .column(Column::exact(52.0))
                 .column(Column::exact(64.0))
                 .column(Column::remainder())
+                .min_scrolled_height(112.0)
+                .max_scroll_height(112.0)
                 .header(18.0, |mut h| {
                     for t in ["FREQ", "LOT", "BID", "OFFER", "LOT", "FREQ"] {
                         h.col(|ui| { ui.label(dim(t)); });
                     }
                 })
                 .body(|body| {
-                    body.rows(19.0, BOOK_DEPTH, |mut row| {
+                    body.rows(19.0, nrows, |mut row| {
                         let r = row.index();
                         let clickable_lots =
                             |ui: &mut egui::Ui, lots: &str, side: Side, px: Price,
@@ -658,26 +663,38 @@ impl GuiApp {
                     });
                 });
         });
-        // Totals: freq / lots per side around a bid-vs-offer pressure bar.
+        // Totals: whole-book freq/lots per side around a bid-vs-offer pressure
+        // bar; each figure sits under its table column.
         let (bf, bl) = bids.iter().fold((0i64, 0i64), |a, l| (a.0 + l.freq as i64, a.1 + l.lots));
         let (of, ol) = offers.iter().fold((0i64, 0i64), |a, l| (a.0 + l.freq as i64, a.1 + l.lots));
+        let gap = ui.spacing().item_spacing.x;
+        let cell = |ui: &mut egui::Ui, w: f32, text: RichText| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(w, 18.0),
+                egui::Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.label(text);
+                },
+            );
+        };
         ui.horizontal(|ui| {
-            ui.label(dim(idx::thousands(bf)));
-            ui.label(col(idx::thousands(bl), GREEN).strong());
-            let (resp, p) = ui.allocate_painter(Vec2::new(96.0, 8.0), Sense::hover());
+            cell(ui, 36.0, dim(format!("{:>4}", idx::thousands(bf))));
+            cell(ui, 64.0, col(format!("{:>7}", idx::thousands(bl)), GREEN).strong());
+            // The bar spans the BID and OFFER price columns.
+            let (resp, p) = ui.allocate_painter(Vec2::new(104.0 + gap, 9.0), Sense::hover());
             let rect = resp.rect;
             let split = rect.left() + rect.width() * (bl as f32 / (bl + ol).max(1) as f32);
             p.rect_filled(
                 egui::Rect::from_min_max(rect.min, egui::Pos2::new(split, rect.bottom())),
                 2.0,
-                GREEN_DARK,
+                GREEN,
             );
             p.rect_filled(
                 egui::Rect::from_min_max(egui::Pos2::new(split, rect.top()), rect.max),
                 2.0,
-                RED_DARK,
+                Color32::from_rgb(150, 48, 55),
             );
-            ui.label(col(idx::thousands(ol), RED).strong());
+            cell(ui, 64.0, col(format!("{:>7}", idx::thousands(ol)), RED).strong());
             ui.label(dim(idx::thousands(of)));
         });
         if let Some(price) = price_pick {
@@ -740,17 +757,19 @@ impl GuiApp {
             // side
             ui.horizontal(|ui| {
                 let side = self.app.entry.side;
-                let buy_fill = if side == Side::Bid { GREEN_DARK } else { BTN_DARK };
-                let sell_fill = if side == Side::Offer { RED_DARK } else { BTN_DARK };
                 let w = (ui.available_width() - 8.0) / 2.0;
+                let (buy_fill, buy_txt) =
+                    if side == Side::Bid { (GREEN, WHITE) } else { (BTN_DARK, DIM) };
+                let (sell_fill, sell_txt) =
+                    if side == Side::Offer { (RED, WHITE) } else { (BTN_DARK, DIM) };
                 if ui
-                    .add_sized([w, 26.0], Button::new(col("BUY", GREEN).strong()).fill(buy_fill))
+                    .add_sized([w, 28.0], Button::new(col("Buy", buy_txt).strong()).fill(buy_fill))
                     .clicked()
                 {
                     self.app.open_form(Side::Bid, None);
                 }
                 if ui
-                    .add_sized([w, 26.0], Button::new(col("SELL", RED).strong()).fill(sell_fill))
+                    .add_sized([w, 28.0], Button::new(col("Sell", sell_txt).strong()).fill(sell_fill))
                     .clicked()
                 {
                     self.app.open_form(Side::Offer, None);
@@ -861,13 +880,13 @@ impl GuiApp {
             // submit
             let side = self.app.entry.side;
             let (label, fill) = match side {
-                Side::Bid => (format!("SUBMIT BUY {ticker}"), GREEN_DARK),
-                Side::Offer => (format!("SUBMIT SELL {ticker}"), RED_DARK),
+                Side::Bid => (format!("Buy {ticker}"), GREEN),
+                Side::Offer => (format!("Sell {ticker}"), RED),
             };
             if ui
                 .add_sized(
-                    [ui.available_width(), 30.0],
-                    Button::new(col(label, side_color(side)).strong()).fill(fill),
+                    [ui.available_width(), 32.0],
+                    Button::new(col(label, WHITE).strong()).fill(fill),
                 )
                 .clicked()
             {
